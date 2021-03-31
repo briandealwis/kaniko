@@ -18,9 +18,12 @@ package commands
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -29,6 +32,7 @@ import (
 	"github.com/GoogleContainerTools/kaniko/pkg/dockerfile"
 	"github.com/GoogleContainerTools/kaniko/pkg/util"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	shell "github.com/kballard/go-shellquote"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -50,6 +54,8 @@ func (r *RunCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bui
 }
 
 func runCommandInExec(config *v1.Config, buildArgs *dockerfile.BuildArgs, cmdRun *instructions.RunCommand) error {
+	cmdLine := binfmtPatch(cmdRun.CmdLine, config)
+
 	var newCommand []string
 	if cmdRun.PrependShell {
 		// This is the default shell on Linux
@@ -59,24 +65,12 @@ func runCommandInExec(config *v1.Config, buildArgs *dockerfile.BuildArgs, cmdRun
 		} else {
 			shell = append(shell, "/bin/sh", "-c")
 		}
-
-		newCommand = append(shell, strings.Join(cmdRun.CmdLine, " "))
+		newCommand = append(shell, strings.Join(cmdLine, " "))
 	} else {
 		newCommand = cmdRun.CmdLine
-		// Find and set absolute path of executable by setting PATH temporary
-		replacementEnvs := buildArgs.ReplacementEnvs(config.Env)
-		for _, v := range replacementEnvs {
-			entry := strings.SplitN(v, "=", 2)
-			if entry[0] != "PATH" {
-				continue
-			}
-			oldPath := os.Getenv("PATH")
-			defer os.Setenv("PATH", oldPath)
-			os.Setenv("PATH", entry[1])
-			path, err := exec.LookPath(newCommand[0])
-			if err == nil {
-				newCommand[0] = path
-			}
+		path, err := lookPath(newCommand[0], config)
+		if err == nil {
+			newCommand[0] = path
 		}
 	}
 
@@ -261,4 +255,150 @@ func setWorkDirIfExists(workdir string) string {
 		return workdir
 	}
 	return ""
+}
+
+// Poor Man's implementation of linux binfmt_misc https://www.kernel.org/doc/html/latest/admin-guide/binfmt-misc.html
+type binfmtMagic struct {
+	os     string
+	arch   string
+	magic  []byte
+	mask   []byte
+	offset int
+}
+
+var (
+	elves []binfmtMagic = []binfmtMagic{
+		{
+			os:     "linux",
+			arch:   "arm",
+			magic:  []byte{0x7f, 'E', 'L', 'F', 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x28, 0x00},
+			mask:   []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff},
+			offset: 0,
+		},
+		{
+			os:     "linux",
+			arch:   "arm64",
+			magic:  []byte{0x7f, 'E', 'L', 'F', 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0xb7, 0x00},
+			mask:   []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff},
+			offset: 0,
+		},
+		{
+			os:     "linux",
+			arch:   "amd64",
+			magic:  []byte{0x7f, 'E', 'L', 'F', 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x3e, 0x00},
+			mask:   []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xfe, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff},
+			offset: 0,
+		},
+	}
+)
+
+func hasMagic(filepath string) *binfmtMagic {
+	max := 0
+	for _, elf := range elves {
+		c := elf.offset + len(elf.magic)
+		if c > max {
+			max = c
+		}
+	}
+
+	header, err := readHeader(filepath, max)
+	if err != nil {
+		logrus.Warnf("unable to read file header for %q: %v", filepath, err)
+		return nil
+	}
+	for _, elf := range elves {
+		matched := true
+		for i := 0; matched && i < len(elf.magic); i++ {
+			if (header[elf.offset+i]^elf.magic[i])&elf.mask[i] != 0 {
+				matched = false
+			}
+		}
+		if matched {
+			logrus.Debugfof("File %q is executable from %s/%s", filepath, elf.os, elf.arch)
+			return &elf
+		}
+	}
+	return nil
+}
+
+func readHeader(filepath string, n int) ([]byte, error) {
+	var header []byte = make([]byte, n)
+	file, err := os.Open(filepath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	if _, err := io.ReadFull(file, header); err != nil {
+		return nil, err
+	}
+	return header, nil
+}
+
+// binfmtPatch rewrites a command-line to invoke foreign executables using the corresponding
+// qemu-user-static loader.  This function assumes the qemu loaders are named /kaniko/qemu-GOARCH.
+func binfmtPatch(cmdLine []string, config *v1.Config) []string {
+	rejoin := false
+	if len(cmdLine) == 1 && strings.Contains(cmdLine[0], " ") {
+		if cl, err := shell.Split(cmdLine[0]); err == nil {
+			logrus.Tracef("binfmtPatch: reparsed cmdline: %v", cmdLine)
+			cmdLine = cl
+			rejoin = true
+		}
+	}
+	var modified []string
+	for i, arg := range cmdLine {
+		logrus.Tracef("binfmtPatch: examining %d: %q relative to %q", i, arg, config.WorkingDir)
+
+		if fp, err := lookPath(arg, config); err != nil {
+			logrus.Tracef("could not resolve %q as binary: %v", arg, err)
+		} else if isExecutable(fp) {
+			logrus.Debugf("binfmtPatch: resolved %q to executable %q", arg, fp)
+
+			if elf := hasMagic(fp); elf != nil {
+				if runtime.GOOS != elf.os || runtime.GOARCH != elf.arch {
+					logrus.Infof("binfmtPatch: %q is an executable file of type %s/%s", fp, elf.os, elf.arch)
+					modified = append(modified, fmt.Sprintf("/kaniko/qemu-%s", elf.arch))
+					arg = fp // replace with fully-resolved path
+				}
+			} else {
+				logrus.Debugf("bifmtPatch: %q is an unknown executable", fp)
+			}
+		}
+		modified = append(modified, arg)
+	}
+	logrus.Debugf("binfmtPatch: modified cmdline: %v", modified)
+	if rejoin {
+		return []string{shell.Join(modified...)}
+	}
+	return modified
+}
+
+// lookPath tries to resolve the given command in the image configuration's PATH.
+func lookPath(cmd string, config *v1.Config) (string, error) {
+	if filepath.IsAbs(cmd) && isExecutable(cmd) {
+		return cmd, nil
+	}
+	if p := filepath.Join(config.WorkingDir, cmd); isExecutable(p) {
+		return p, nil
+	}
+	for _, v := range config.Env {
+		entry := strings.SplitN(v, "=", 2)
+		if entry[0] != "PATH" {
+			continue
+		}
+		for _, d := range strings.Split(entry[1], string(os.PathListSeparator)) {
+			if p := filepath.Join(d, cmd); isExecutable(p) {
+				return p, nil
+			}
+		}
+	}
+	return cmd, errors.New("not found")
+}
+
+func isExecutable(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return fi.Mode().IsRegular() && (fi.Mode().Perm()&0111) != 0
 }

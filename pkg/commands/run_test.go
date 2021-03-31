@@ -325,3 +325,10 @@ func TestSetWorkDirIfExists(t *testing.T) {
 	testutil.CheckDeepEqual(t, testDir, setWorkDirIfExists(testDir))
 	testutil.CheckDeepEqual(t, "", setWorkDirIfExists("doesnot-exists"))
 }
+
+func TestHasMagic(t *testing.T) {
+	files := []string{"/bin/sh", "/tmp/goland-amd64/usr/local/go/bin/go"}
+	for _, f := range files {
+		t.Logf("file %q is %v\n", f, hasMagic(f))
+	}
+}

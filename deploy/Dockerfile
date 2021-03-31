@@ -52,6 +52,18 @@ RUN mkdir -p /kaniko/.docker
 COPY . .
 RUN make GOARCH=$(cat /goarch.txt)
 
+# Install Qemu
+# TODO: I think this installs qemu 3.1: figure out how to use qemu 5.2
+FROM debian:buster AS qemu
+RUN apt-get update && apt-get install -y qemu-user-static && \
+  mkdir /qemu && \
+  mv /usr/bin/qemu-x86_64-static /qemu/qemu-amd64 && \
+  mv /usr/bin/qemu-aarch64-static /qemu/qemu-arm64 && \
+  mv /usr/bin/qemu-arm-static /qemu/qemu-arm && \
+  mv /usr/bin/qemu-ppc64le-static /qemu/qemu-ppc64le && \
+  mv /usr/bin/qemu-s390x-static /qemu/qemu-s390x && \
+  mv /usr/bin/qemu-riscv64-static /qemu/qemu-riscv64
+
 # Generate latest ca-certificates
 
 FROM debian:buster-slim AS certs
@@ -68,6 +80,7 @@ COPY --from=0 /go/src/github.com/awslabs/amazon-ecr-credential-helper/bin/local/
 COPY --from=0 /go/src/github.com/chrismellard/docker-credential-acr-env/build/docker-credential-acr-env /kaniko/docker-credential-acr
 COPY --from=certs /ca-certificates.crt /kaniko/ssl/certs/
 COPY --from=0 /kaniko/.docker /kaniko/.docker
+COPY --from=qemu /qemu/* /kaniko/
 COPY files/nsswitch.conf /etc/nsswitch.conf
 ENV HOME /root
 ENV USER root
